@@ -1,0 +1,213 @@
+import torch
+from torch import nn
+
+import sys
+
+# OpV1LoopFunction
+# dxi = dL/dyi dyi/dxi + dL/dya dya/dxi 
+# dxa = dL/dyi dyi/dxa + dL/dya dya/dxa
+
+# dxi = dL/dyi (dxi/dxi + dya/dxi) + dL/dya (dxa/dxi + dF/dxi) 
+#     = dL/dyi (dxi/dxi + dF/dxi) + dL/dya (dxa/dxi + dF/dxi)
+#     = dL/dyi (1 + dF/dxi) + dL/dya (0 + dF/dxi)
+#     = dL/dyi * 1 + dL/dyi * dF/dxi + dL/dya * dF/dxi
+
+# dxa = dL/dyi (dxi/dxa + dya/dxa) + dL/dya (dxa/dxa + dF/dxa) 
+#     = dL/dyi (dxi/dxa + (dxa/dxa + dF/dxa)) + dL/dya (dxa/dxa + dF/dxa)
+#     = dL/dyi (0 + (1 + 0)) + dL/dya (1 + 0)
+#     = dL/dyi  + dL/dya
+
+# dF  = dL/dyi dyi/dF + dL/dya dya/F
+#     = dL/dyi (dxi/dF + dya/dF) + dL/dya (dxa/F + dF/dF)
+#     = dL/dyi (dxi/dF + (dxa/dF + dF/dF))) + dL/dya (dxa/F + dF/dF)
+#     = dL/dyi (0 + (0 + dF/dF))) + dL/dya (0 + dF/dF)
+#     = dL/dyi  dF/dF + dL/dya dF/dF
+
+
+# New version, using single for-loop.
+# https://github.com/renmengye/revnet-public/blob/master/resnet/models/revnet_model.py
+
+class OpV1ModuleIteratorFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        xi,
+        xa,
+        cos,
+        sin,
+        mask,
+        input_pos,
+        input_pos_maxp1,
+        rope_indices,
+        modules_F,
+        *module_weights
+    ):
+        fwd_device_states = []
+        ctx.modules_F = modules_F
+
+        num_modules = len(modules_F)
+
+        with torch.no_grad():
+            yi = xi.clone().detach().contiguous()
+            ya = xa.clone().detach().contiguous()
+
+            for i in range(0, num_modules):
+                
+                # https://github.com/huggingface/transformers/blob/v5.0.0rc1/src/transformers/models/reformer/modeling_reformer.py#L1833
+                # randomize seeds
+                # use cuda generator if available
+                if hasattr(torch.cuda, "default_generators") and len(torch.cuda.default_generators) > 0:
+                    # GPU
+                    device_idx = torch.cuda.current_device()
+                    fwd_state = torch.cuda.default_generators[device_idx].seed()
+                else:
+                    # CPU
+                    fwd_state = int(torch.seed() % sys.maxsize)
+
+                torch.manual_seed(fwd_state)
+                fwd_device_states.append(fwd_state)
+
+                if rope_indices is not None:
+                    tmp = modules_F[i](yi, cos[..., rope_indices[i // 2]], sin[..., rope_indices[i // 2]], mask, input_pos, input_pos_maxp1 )
+                else:
+                    tmp = modules_F[i](yi, cos, sin, mask, input_pos, input_pos_maxp1 )
+                
+                ya.add_(tmp) 
+                yi.add_(ya)
+                del tmp
+        
+        del xi, xa
+            
+        ctx.save_for_backward(yi, ya)
+
+        ctx.fwd_device_states = fwd_device_states
+
+        ctx.cos = cos
+        ctx.sin = sin
+        ctx.mask = mask
+        ctx.input_pos = input_pos
+        ctx.input_pos_maxp1 = input_pos_maxp1
+        ctx.rope_indices = rope_indices
+
+        return yi, ya
+
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        dyi, dya = grad_outputs
+        
+        (yi, ya) = ctx.saved_tensors
+
+        fwd_device_states = ctx.fwd_device_states
+
+        cos = ctx.cos
+        sin = ctx.sin
+        mask = ctx.mask
+        input_pos = ctx.input_pos
+        input_pos_maxp1 = ctx.input_pos_maxp1
+        rope_indices = ctx.rope_indices
+
+
+        modules_F = ctx.modules_F
+        num_modules = len(modules_F)
+
+        grads_weights_F = []
+
+        yi = yi.detach().requires_grad_(False)
+        ya = ya.detach().requires_grad_(False)
+
+        for i in range(num_modules - 1, -1, -1):
+
+            with torch.no_grad():
+                yi.sub_(ya)  # (yi = xi + ya)
+
+            with torch.enable_grad():
+                yi.requires_grad_(True)
+
+                # set seed to have correct dropout
+                torch.manual_seed(fwd_device_states[i])
+
+                if rope_indices is not None:
+                    F_xi = modules_F[i](yi, cos[..., rope_indices[i // 2]], sin[..., rope_indices[i // 2]], mask, input_pos, input_pos_maxp1 )
+                else:
+                    F_xi = modules_F[i](yi, cos, sin, mask, input_pos, input_pos_maxp1)
+
+                ddF = torch.autograd.grad(F_xi, (yi, ) + tuple(modules_F[i].parameters()), dyi + dya)
+
+            yi.detach_().requires_grad_(False)
+            F_xi = F_xi.detach()
+
+            with torch.no_grad():            
+                ya.sub_(F_xi)  # (ya = xa + F(xi))
+                del F_xi
+
+                grads_weights_F.append(ddF[1:])
+                dya.add_(dyi) # dxa = dyi + dya
+
+                dyi.add_(ddF[0])  # dxi = dyi + ddF[0]
+                del ddF
+
+        with torch.no_grad():
+            yi.detach_().requires_grad_(False)        
+            ya.detach_().requires_grad_(False)        
+            del yi, ya
+
+            grads_weights_F.reverse()
+
+            grads_weights = [grad for module_grads in grads_weights_F for grad in module_grads]
+
+            grads = (dyi, dya, None, None, None, None, None, None, None) + tuple(grads_weights)
+        
+        
+        return grads 
+
+
+class ResNetOpV1ModuleIterator(nn.Module):
+    
+    def __init__(self, res_modules):
+        super().__init__()
+        self.res_modules = res_modules
+
+        
+    def forward(self, xi, xa, cos, sin, mask, input_pos, input_pos_maxp1, rope_indices):
+        module_weights = [p for res_module in self.res_modules for p in res_module.parameters() ]
+        yi, ya = OpV1ModuleIteratorFunction.apply(
+            xi,
+            xa,
+            cos, 
+            sin, 
+            mask, 
+            input_pos, 
+            input_pos_maxp1,
+            rope_indices,
+            self.res_modules,
+            *module_weights
+        )
+
+        return yi, ya
+
+
+class ResNetOpV1ModuleIteratorWBackprop(nn.Module):
+    
+    def __init__(self, res_modules):
+        super().__init__()
+        self.res_modules = res_modules
+        
+    def forward(self, xi, xa, cos, sin, mask, input_pos, input_pos_maxp1, rope_indices):
+        num_modules = len(self.res_modules)
+
+        for i in range(0, num_modules):
+
+            if rope_indices is not None:
+                tmp = self.res_modules[i](xi, cos[..., rope_indices[i // 2]], sin[..., rope_indices[i // 2]], mask, input_pos, input_pos_maxp1 )
+            else:
+                tmp = self.res_modules[i](xi, cos, sin, mask, input_pos, input_pos_maxp1 )
+
+            ya = xa + tmp
+            yi = xi + ya
+
+            xa = ya
+            xi = yi
+
+        return yi, ya
